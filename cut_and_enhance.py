@@ -505,7 +505,7 @@ def mubiao_qiege_hecheng_multi(sources, bg_img_path, output_size=(1120, 560), ma
         if bg_range is not None and bg_range > 25:
             bg_center = (560, 560)
             try:
-                rotated_roi = simulate_sonar_scaled_fixed_dots_no_blur(rotated_roi, new_x, new_y, bg_center, bg_range,
+                rotated_roi = simulate_sonar_scaled(rotated_roi, new_x, new_y, bg_center, bg_range,
                                                         output_size)
                 # 重新提取alpha通道和目标BGR（降采样后）
                 if rotated_roi.shape[2] == 4:
