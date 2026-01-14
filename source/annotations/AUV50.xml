@@ -1,0 +1,25 @@
+<annotation>
+	<folder>my-project-name</folder>
+	<filename>AUV50_11.png</filename>
+	<path>/my-project-name/AUV50_11.png</path>
+	<source>
+		<database>Unspecified</database>
+	</source>
+	<size>
+		<width>1120</width>
+		<height>560</height>
+		<depth>3</depth>
+	</size>
+	<object>
+		<name>AUV</name>
+		<pose>Unspecified</pose>
+		<truncated>0</truncated>
+		<difficult>0</difficult>
+		<bndbox>
+			<xmin>549</xmin>
+			<ymin>505</ymin>
+			<xmax>568</xmax>
+			<ymax>520</ymax>
+		</bndbox>
+	</object>
+</annotation>
