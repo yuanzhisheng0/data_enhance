@@ -17,7 +17,6 @@ from other_enhance.enhance import (
     shuiping,  # 水平翻转
     chuizhi,  # 垂直翻转
     suiji_xuanzhuan,  # 随机角度旋转（0-360度）
-    mubiao_suofang,  # 目标缩放
 )
 
 
@@ -74,100 +73,110 @@ def extract_red_target_with_transparency(roi):
     return roi_bgra, red_mask
 
 
-def simulate_sonar_scaled(roi_bgra, paste_x, paste_y, bg_center, max_range_m, output_size):
+def apply_polar_grid_downsampling(roi_bgra, paste_x, paste_y, bg_center, max_range_m, output_size):
     """
-    针对0.3倍缩放后的目标进行声呐仿真。
-    特点：点稀疏、保留形态、固定半径2像素。
-    原理：极坐标筛网过滤法。
+    进行极坐标网格降采样。
+    目的：
+    1. 保持目标原有的轮廓形态。
+    2. 点变少（稀疏化）。
+    3. 强制每个点的显示效果为半径2像素（直径4像素）。
     """
     if roi_bgra is None or roi_bgra.size == 0:
         return roi_bgra
 
     h, w = roi_bgra.shape[:2]
-    # 提取原始 Alpha 通道 (作为形态基准)
-    original_alpha = roi_bgra[:, :, 3]
+    alpha = roi_bgra[:, :, 3]
 
-    # 1. 提取所有可见像素坐标
-    # 使用较低的阈值，确保捕捉到缩放后可能变淡的边缘
-    vis_y, vis_x = np.where(original_alpha > 5)
+    # 1. 提取目标上的所有有效像素
+    # 使用 >10 的阈值过滤掉完全透明的边缘
+    vis_y, vis_x = np.where(alpha > 10)
     if vis_y.size == 0:
         return roi_bgra
 
-    # 2. 坐标转换 (像素 -> 全局 -> 极坐标)
+    # 2. 计算相对于声呐圆心的极坐标
     cx, cy = bg_center
     global_x = paste_x + vis_x
     global_y = paste_y + vis_y
     dx = global_x - cx
     dy = global_y - cy
-    # 使用 float32 提高计算精度
+
+    # 转换为 float32 避免计算溢出
     r = np.sqrt(dx.astype(np.float32) ** 2 + dy.astype(np.float32) ** 2)
     theta = np.arctan2(dy, dx)
 
-    # 3. 极坐标网格量化 (核心降采样步骤)
-    # -----------------------------------------------------
+    # 3. 定义网格参数 (控制稀疏度的核心)
     pixel_to_meter = max_range_m / float(output_size[1])
 
-    # 【关键参数调整】：针对 0.3x 缩放的小目标
-    # 目标很小，如果网格太大，整个目标可能就只剩1个点了。
-    # 如果网格太小，半径为2的点就会粘连。
+    # 计算目标质心的实际距离（米）
+    # 目标质心 = 所有像素坐标的平均值
+    center_x = np.mean(global_x)
+    center_y = np.mean(global_y)
+    center_dx = center_x - bg_center[0]
+    center_dy = center_y - bg_center[1]
+    center_r_pixels = np.sqrt(center_dx**2 + center_dy**2)
+    center_r_meters = center_r_pixels * pixel_to_meter  # 质心实际距离
 
-    # A. 径向分辨率 (Range Resolution)
-    # 设为 0.5米左右。对于缩放后的目标，这能保留纵向的几个层次。
-    range_res_m = 0.65
-    range_step_px = range_res_m / pixel_to_meter
+    # 根据背景类型和目标位置决定是否应用降采样及强度
+    apply_downsampling = False
+    
+    # 16m与25米背景：不应用降采样
+    if max_range_m <= 25:
+        apply_downsampling = False
+    else:
+        # 50m与100m背景：根据目标实际距离应用降采样
+        # 不区分左右侧，所有位置都可能应用降采样
+        if center_r_meters >= 25:  # 实际距离≥25m时应用降采样
+            apply_downsampling = True
+            if 25 <= center_r_meters < 50:
+                # 25-50m：细网格（弱降采样）
+                r_step_m = 0.4
+                theta_step_deg = 1.2
+            elif 50 <= center_r_meters <= 100:
+                # 50-100m：粗网格（强降采样）
+                r_step_m = 0.7
+                theta_step_deg = 1.35
+            else:
+                # >100m：使用强降采样
+                r_step_m = 0.7
+                theta_step_deg = 1.35
 
-    # B. 方位分辨率 (Azimuth Resolution) - 最关键!
-    # 为了防止半径为2 (直径4) 的点横向粘连，相邻网格中心的间距必须大于4像素。
-    # 建议设置较大的角度，确保稀疏。
-    # 1.5度到 2.0度是一个比较安全的值，能保证点分开。
-    bearing_res_deg = 2.5
-    bearing_step_rad = np.deg2rad(bearing_res_deg)
+    # 如果不需要降采样，直接返回原始图像
+    if not apply_downsampling:
+        return roi_bgra
 
-    # 量化与去重 (找出稀疏的中心点)
-    r_bin = (r / range_step_px).astype(np.int32)
-    theta_bin = (theta / bearing_step_rad).astype(np.int32)
+    r_step_px = r_step_m / pixel_to_meter
+    theta_step_rad = np.deg2rad(theta_step_deg)
+
+    # 4. 网格量化与去重 (Quantization & Unique)
+    # 计算每个像素属于哪个网格
+    r_bin = np.round(r / r_step_px).astype(np.int32)
+    theta_bin = np.round(theta / theta_step_rad).astype(np.int32)
+
+    # 组合网格索引
     bins = np.stack((r_bin, theta_bin), axis=1)
-    # return_index=True 返回 unique 元素在原数组中的索引
+
+    # 去重：同一个网格内只保留 1 个像素
+    # 实现“降采样”，把密集的像素变成了稀疏的网格代表点
     _, unique_indices = np.unique(bins, axis=0, return_index=True)
 
     # 获取保留点的局部坐标
     kept_x = vis_x[unique_indices]
     kept_y = vis_y[unique_indices]
 
-    # 4. 生成固定半径的“筛网”遮罩 (The Sieve Mask)
-    # -----------------------------------------------------
-    # 创建一个全黑的遮罩层
-    sieve_mask = np.zeros((h, w), dtype=np.uint8)
-
-    # 硬编码要求的半径
-    fixed_radius = 2
-
-    for lx, ly in zip(kept_x, kept_y):
-        # 在遮罩上画实心白圆 (打孔)
-        # 注意：这里画的是锐利的圆，没有模糊
-        cv2.circle(sieve_mask, (lx, ly), fixed_radius, 255, -1)
-
-    # 5. 组合最终图像 (求交集)
-    # -----------------------------------------------------
-    # 创建一个新的图像容器
+    # 5. 重绘：在保留点位置画半径为2的圆
+    # 创建新的空图
     new_roi = np.zeros_like(roi_bgra)
 
-    # 设置目标颜色 (例如纯红，或者保留原图颜色)
-    # 如果要保留原图纹理，取消下面三行的注释，并注释掉设置纯色的代码
-    # new_roi[:, :, 0] = roi_bgra[:, :, 0]
-    # new_roi[:, :, 1] = roi_bgra[:, :, 1]
-    # new_roi[:, :, 2] = roi_bgra[:, :, 2]
-    # 这里设为纯红以便观察效果：
-    new_roi[:, :, 0] = 0  # B
-    new_roi[:, :, 1] = 0  # G
-    new_roi[:, :, 2] = 255  # R
+    # 设置目标颜色（这里用纯红，也可以取原图颜色）
+    color_bgr = (0, 0, 255)
 
-    # 【核心操作】：计算最终的 Alpha 通道
-    # 逻辑：(原图有像素) AND (筛网有孔)
-    # 结果：既保留了原图的形态边界，又被限制在了半径2的圆孔内。
-    final_alpha = cv2.bitwise_and(original_alpha, sieve_mask)
+    for lx, ly in zip(kept_x, kept_y):
+        # cv2.circle 参数：img, center, radius, color, thickness
+        # radius=2 (直径4)，thickness=-1 (实心)
+        cv2.circle(new_roi, (lx, ly), 2, color_bgr + (255,), -1)
 
-    new_roi[:, :, 3] = final_alpha
+        # 抗锯齿线型：
+        # cv2.circle(new_roi, (lx, ly), 2, color_bgr + (255,), -1, lineType=cv2.LINE_AA)
 
     return new_roi
 
@@ -313,7 +322,7 @@ def apply_roi_augmentation(roi, augmentation_funcs):
 
 
 def mubiao_qiege_hecheng_multi(sources, bg_img_path, output_size=(1120, 560), max_targets=3, allow_repeat=True,
-                               roi_augmentation_funcs=None, bg_scale=None, bg_range=None):
+                               roi_augmentation_funcs=None, bg_range=None):
     """
     从多张源图中随机选择多个目标（可重复），贴到同一张背景图上，生成多目标合成图。
 
@@ -399,20 +408,12 @@ def mubiao_qiege_hecheng_multi(sources, bg_img_path, output_size=(1120, 560), ma
         if roi_augmentation_funcs:
             target_roi = apply_roi_augmentation(target_roi, roi_augmentation_funcs)
 
-        # 根据背景尺度先对裁切目标进行缩放
-        if bg_scale is not None:
-            try:
-                h0, w0 = target_roi.shape[:2]
-                target_roi, _ = mubiao_suofang(target_roi, [[0, 0, w0, h0]], scale_range=bg_scale)
-            except Exception:
-                pass
-
         # 提取红色目标区域，创建透明背景（只保留红色区域）
         target_roi_bgra, red_mask = extract_red_target_with_transparency(target_roi)
         if target_roi_bgra is None:
             continue
 
-        # 使用旋转（后续流程会旋转ROI via suiji_xuanzhuan if needed）
+        # 使用旋转
         # 将BGRA转换回BGR用于旋转（旋转函数需要BGR格式）
         target_roi = cv2.cvtColor(target_roi_bgra, cv2.COLOR_BGRA2BGR)
 
@@ -505,7 +506,7 @@ def mubiao_qiege_hecheng_multi(sources, bg_img_path, output_size=(1120, 560), ma
         if bg_range is not None and bg_range > 25:
             bg_center = (560, 560)
             try:
-                rotated_roi = simulate_sonar_scaled(rotated_roi, new_x, new_y, bg_center, bg_range,
+                rotated_roi = apply_polar_grid_downsampling(rotated_roi, new_x, new_y, bg_center, bg_range,
                                                         output_size)
                 # 重新提取alpha通道和目标BGR（降采样后）
                 if rotated_roi.shape[2] == 4:
@@ -607,12 +608,13 @@ def complete_enhancement_pipeline(source_img_dir, source_xml_dir, bg_img_path,
     # 注意：只使用适合单个ROI的增强函数
     # 直接复用 other_enhance/enhance.py 中定义的函数
     # 注意：旋转会在增强后作为独立步骤应用，所以不包含在列表中
+    # 注意：缩放功能已移除，只保留翻转增强
     roi_augmentation_funcs = [
         shuiping,  # 水平翻转
         chuizhi,  # 垂直翻转
     ]
 
-    # 预先收集全部源图 + 标注框
+    # 预先收集全部源图 + 标注框，并解析距离信息
     sources = []
     for img_path in img_files:
         base_name = os.path.splitext(os.path.basename(img_path))[0]
@@ -624,23 +626,32 @@ def complete_enhancement_pipeline(source_img_dir, source_xml_dir, bg_img_path,
             continue
         _, bboxes, names, poses = parse_xml(xml_path)
         if bboxes:
-            sources.append({"img": img_mat, "bboxes": bboxes, "names": names, "poses": poses})
+            # 解析文件名中的距离信息（例如：AUV16 -> 16, ball25 -> 25）
+            distance = None
+            if base_name.endswith('16'):
+                distance = 16
+            elif base_name.endswith('25'):
+                distance = 25
+            elif base_name.endswith('50'):
+                distance = 50
+            elif base_name.endswith('100'):
+                distance = 100
+
+            sources.append({
+                "img": img_mat,
+                "bboxes": bboxes,
+                "names": names,
+                "poses": poses,
+                "distance": distance,
+                "filename": base_name
+            })
 
     if not sources:
         print("错误：没有可用于拼接的目标")
         return
 
-    # 根据背景文件名设定目标缩放比例（以16m为基准）
+    # 根据背景文件名设定最大距离（米），用于降采样判断
     bg_base = os.path.splitext(os.path.basename(bg_img_path))[0].lower()
-    if bg_base.startswith("16"):
-        bg_scale = 1.0
-    elif bg_base.startswith("25"):
-        bg_scale = 0.8
-    elif bg_base.startswith("50"):
-        bg_scale = 0.5
-    elif bg_base.startswith("100"):
-        bg_scale = 0.3
-    # 背景对应的最大距离（米），用于降采样判断
     if bg_base.startswith("16"):
         bg_range = 16
     elif bg_base.startswith("25"):
@@ -651,6 +662,15 @@ def complete_enhancement_pipeline(source_img_dir, source_xml_dir, bg_img_path,
         bg_range = 100
     else:
         bg_range = None
+
+    # 根据背景距离过滤sources，只使用相同距离的目标
+    filtered_sources = [s for s in sources if s.get("distance") == bg_range]
+
+    if not filtered_sources:
+        print(f"警告：背景距离{bg_range}米没有对应的目标素材，将使用所有可用目标")
+        filtered_sources = sources
+
+    print(f"使用 {len(filtered_sources)} 个距离{bg_range}米的目标素材进行拼接")
 
     # 多图目标切割并合成
     final_count = 1
@@ -663,13 +683,12 @@ def complete_enhancement_pipeline(source_img_dir, source_xml_dir, bg_img_path,
         try:
             dynamic_max_targets = random.randint(3, 6)
             new_img, new_bboxes, new_names, new_poses = mubiao_qiege_hecheng_multi(
-                sources,
+                filtered_sources,
                 bg_img_path,
                 output_size=output_size,
                 max_targets=dynamic_max_targets,
                 allow_repeat=True,
                 roi_augmentation_funcs=roi_augmentation_funcs,  # 在拼接前对目标进行增强
-                bg_scale=bg_scale,
                 bg_range=bg_range
             )
 
@@ -750,12 +769,17 @@ if __name__ == '__main__':
 
     # 对每个背景分别生成 images_per_background 张图片，输出到不同子目录
     for bg in backgrounds:
-        bg_path = bg
-        bg_name = os.path.splitext(os.path.basename(bg))[0]
-        out_dir = os.path.join(final_output_dir, bg_name)
-        os.makedirs(out_dir, exist_ok=True)
-        print(f"开始为背景 {bg_path} 生成 {images_per_background} 张增强图，输出到 {out_dir}")
-    complete_enhancement_pipeline(
-        source_img_dir, source_xml_dir, bg_path, out_dir,
-        cut_move_augmentations, output_size, images_per_bg=images_per_background
-    )
+        try:
+            bg_path = bg
+            bg_name = os.path.splitext(os.path.basename(bg))[0]
+            out_dir = os.path.join(final_output_dir, bg_name)
+            os.makedirs(out_dir, exist_ok=True)
+            print(f"开始为背景 {bg_path} 生成 {images_per_background} 张增强图，输出到 {out_dir}")
+            complete_enhancement_pipeline(
+                source_img_dir, source_xml_dir, bg_path, out_dir,
+                cut_move_augmentations, output_size, images_per_bg=images_per_background
+            )
+            print(f"背景 {bg_path} 处理完成")
+        except Exception as e:
+            print(f"处理背景 {bg} 时出错：{e}")
+            continue

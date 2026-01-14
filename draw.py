@@ -19,6 +19,7 @@ for bg in backgrounds:
     vis_subdir = os.path.join(vis_dir, bg)
     os.makedirs(vis_subdir, exist_ok=True)
 
+    print(f'处理背景 {bg}...')
     for i in range(1, num_per_bg + 1):
         img_path = os.path.join(img_dir, f'final_{i:04}.png')
         xml_path = os.path.join(xml_dir, f'final_{i:04}.xml')
@@ -34,7 +35,14 @@ for bg in backgrounds:
             print(f'解析 XML 失败: {xml_path}，{e}')
             continue
         root = tree.getroot()
-        for obj in root.findall('object'):
+
+        # 统计目标数量
+        objects = root.findall('object')
+        print(f'  处理 {bg}/final_{i:04}: 找到 {len(objects)} 个目标')
+
+        # 绘制所有边界框
+        bbox_count = 0
+        for obj in objects:
             bbox = obj.find('bndbox')
             if bbox is None:
                 continue
@@ -47,6 +55,9 @@ for bg in backgrounds:
                 continue
             # 画框（红色，线宽2）
             cv2.rectangle(img, (xmin, ymin), (xmax, ymax), (0, 0, 255), 2)
-            # 保存可视化图片到子目录
-            vis_path = os.path.join(vis_subdir, f'vis_{i:04}.png')
-            cv2.imwrite(vis_path, img)
+            bbox_count += 1
+
+        # 保存可视化图片到子目录（在循环外面保存一次）
+        vis_path = os.path.join(vis_subdir, f'vis_{i:04}.png')
+        cv2.imwrite(vis_path, img)
+        print(f'    保存: {vis_path} (绘制了 {bbox_count} 个边界框)')
