@@ -58,6 +58,6 @@ for bg in backgrounds:
             bbox_count += 1
 
         # 保存可视化图片到子目录（在循环外面保存一次）
-        vis_path = os.path.join(vis_subdir, f'vis_{i:04}.png')
-        cv2.imwrite(vis_path, img)
+            vis_path = os.path.join(vis_subdir, f'vis_{i:04}.png')
+            cv2.imwrite(vis_path, img)
         print(f'    保存: {vis_path} (绘制了 {bbox_count} 个边界框)')
